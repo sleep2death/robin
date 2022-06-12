@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,26 +19,22 @@ var (
   ErrServerClosed = errors.New("[robin]: server closed")
 )
 
-type any = interface{}
-
 type Handler interface {
-  ServeKCP(ResponseWriter, *Request)
-}
-
-type ResponseWriter interface {
-  Write([]byte)(n int, err error)
+  Serve(ResponseWriter, *Request)
 }
 
 type Request struct {
-  Name string
-  Data any 
+  TypeUrl string
+  Data []byte
 }
 
 type Server struct {
   Listener *kcp.Listener
   Handler Handler
   Logger *zap.SugaredLogger
-
+  
+  // max buf size
+  MaxBufSize uint
 
   // ReadTimeout is the maximum duration for reading the entire
 	// request, including the body.
@@ -79,7 +74,7 @@ func (srv *Server) Serve(ln *kcp.Listener) error {
 
   for {
     rw, err := ln.AcceptKCP()
-    srv.Logger.Infof("[robin]: new connection accpeted, %s", rw.RemoteAddr().String())
+    srv.Logger.Infof("[robin]: new connection accepted, %s", rw.RemoteAddr().String())
     // handle acception errors
     if err != nil {
       select {
@@ -216,30 +211,10 @@ func (srv *Server) shuttingDown() bool {
 // shutdownPollInterval is how often we poll for quiescence
 // during Server.Shutdown. This is lower during tests, to
 // speed up tests.
-// Ideally we could find a solution that doesn't involve polling,
-// but which also doesn't have a high runtime cost (and doesn't
-// involve any contentious mutexes), but that is left as an
-// exercise for the reader.
 var shutdownPollInterval = 500 * time.Millisecond
 
 // Shutdown gracefully shuts down the server without interrupting any
-// active connections. Shutdown works by first closing all open
-// listeners, then closing all idle connections, and then waiting
-// indefinitely for connections to return to idle and then shut down.
-// If the provided context expires before the shutdown is complete,
-// Shutdown returns the context's error, otherwise it returns any
-// error returned from closing the Server's underlying Listener(s).
-//
-// When Shutdown is called, Serve, ListenAndServe, and
-// ListenAndServeTLS immediately return ErrServerClosed. Make sure the
-// program doesn't exit and waits instead for Shutdown to return.
-//
-// Shutdown does not attempt to close nor wait for hijacked
-// connections such as WebSockets. The caller of Shutdown should
-// separately notify such long-lived connections of shutdown and wait
-// for them to close, if desired. See RegisterOnShutdown for a way to
-// register shutdown notification functions.
-//
+// active connections. 
 // Once Shutdown has been called on a server, it may not be reused;
 // future calls to methods such as Serve will return ErrServerClosed.
 func (srv *Server) Shutdown() error {
@@ -307,166 +282,6 @@ func (srv *Server) idleTimeout() time.Duration {
 }
 
 
-// A ConnState represents the state of a client connection to a server.
-type ConnState int
-
-const (
-	// StateNew represents a new connection that is expected to
-	StateNew ConnState = iota
-
-	// StateActive represents a connection that has read 1 or more
-	StateActive
-
-	// StateIdle represents a connection that has finished
-	StateIdle
-
-	// StateClosed represents a closed connection.
-	StateClosed
-)
-
-type conn struct {
-	// server is the server on which the connection arrived.
-	// Immutable; never nil.
-	server *Server
-
-	// rwc is the underlying network connection.
-	// This is never wrapped by other types and is the value given out
-	// to CloseNotifier callers. It is usually of type *net.TCPConn
-	rwc net.Conn
-
-	// remoteAddr is rwc.RemoteAddr().String(). It is not populated synchronously
-	// inside the Listener's Accept goroutine, as some implementations block.
-	// It is populated immediately inside the (*conn).serve goroutine.
-	// This is the value of a Handler's (*Request).RemoteAddr.
-	remoteAddr string
-
-	// werr is set to the first write error to rwc.
-	// It is set via checkConnErrorWriter{w}, where bufw writes.
-	werr error
-
-	// bufr reads from r.
-	bufr *bufio.Reader
-
-	// bufw writes to checkConnErrorWriter{c}, which populates werr on error.
-	bufw *bufio.Writer
-
-	curState struct{ atomic uint64 } // packed (unixtime<<8|uint8(ConnState))
-}
-
-var stateName = map[ConnState]string{
-	StateNew:    "new",
-	StateActive: "active",
-	StateIdle:   "idle",
-	StateClosed: "closed",
-}
-
-func (c ConnState) String() string {
-	return stateName[c]
-}
-
-func (c *conn) setState(nc net.Conn, state ConnState) {
-	srv := c.server
-	switch state {
-	case StateNew:
-		srv.trackConn(c, true)
-	case StateClosed:
-		srv.trackConn(c, false)
-	}
-	if state > 0xff || state < 0 {
-		panic("internal error")
-	}
-	packedState := uint64(time.Now().Unix()<<8) | uint64(state)
-	atomic.StoreUint64(&c.curState.atomic, packedState)
-}
-
-func (c *conn) getState() (state ConnState, unixSec int64) {
-	packedState := atomic.LoadUint64(&c.curState.atomic)
-	return ConnState(packedState & 0xff), int64(packedState >> 8)
-}
-
-func (c *conn) finalFlush() {
-	if c.bufr != nil {
-		// Steal the bufio.Reader (~4KB worth of memory) and its associated
-		// reader for a future connection.
-		putBufioReader(c.bufr)
-		c.bufr = nil
-	}
-
-	if c.bufw != nil {
-		// flush it, anyway
-		_ = c.bufw.Flush()
-		// Steal the bufio.Writer (~4KB worth of memory) and its associated
-		// writer for a future connection.
-		putBufioWriter(c.bufw)
-		c.bufw = nil
-	}
-}
-
-// Close the connection.
-func (c *conn) close() {
-	c.finalFlush()
-	// close it anyway
-	_ = c.rwc.Close()
-}
-
-// Serve a new connection.
-func (c *conn) serve() {
-	// set remote addr
-	c.remoteAddr = c.rwc.RemoteAddr().String()
-
-	defer func() {
-		// recover from reading panic, if failed log the err
-		if err := recover(); err != nil && c.server.shuttingDown() == false {
-			const size = 64 << 10
-			buf := make([]byte, size)
-			buf = buf[:runtime.Stack(buf, false)]
-			c.server.Logger.Errorf("[robin]: panic serving %v: %v\n%s", c.remoteAddr, err, buf)
-		}
-		// close the connection
-		// it will flush the writer, and put the reader&writer back to pool
-		c.close()
-		// untrack the connection
-		c.setState(c.rwc, StateClosed)
-	}()
-
-	// wrap the underline conn with bufio reader&writer
-	// sync pool inside
-	c.bufr = newBufioReader(c.rwc)
-	c.bufw = newBufioWriter(c.rwc)
-
-	// conn loop start
-	for {
-		// handle connection timeout
-		if d := c.server.ReadTimeout; d != 0 {
-			c.rwc.SetReadDeadline(time.Now().Add(d))
-		}
-
-    buf := make([]byte, 4096)
-    n, err := c.bufr.Read(buf)
-
-    c.server.Logger.Infof("data received: %s", buf[:n])
-    c.server.Logger.Infof("current client count: %d", len(c.server.activeConn))
-
-		if err != nil && err != io.EOF {
-			// TODO: log error instead?
-			panic(err)
-		}
-
-		// set underline conn to active mode
-		c.setState(c.rwc, StateActive)
-
-		// set rwc to idle state again
-		c.setState(c.rwc, StateIdle)
-		// handle connection idle
-		if d := c.server.idleTimeout(); d != 0 {
-			c.rwc.SetReadDeadline(time.Now().Add(d))
-			if _, err := c.bufr.Peek(4); err != nil {
-				return
-			}
-		}
-		c.rwc.SetReadDeadline(time.Time{})
-	}
-}
 
 func Key(pass, salt string) (key []byte) {
   key = pbkdf2.Key([]byte(pass), []byte(salt), 1024, 32, sha1.New) 
@@ -482,10 +297,15 @@ func ListenAndServe(addr string, key []byte, handler Handler) error {
 
   var srv = &Server{
     Block: block,
+    MaxBufSize: 4096,
     // Check https://github.com/klauspost/reedsolomon for details
     DataShards: 10,
     ParityShards: 3,
     Handler: handler,
+
+    IdleTimeout: time.Second * 5,
+    WriteTimeout: time.Second * 5,
+    ReadTimeout: time.Second * 5,
   }
 
   ln, err := kcp.ListenWithOptions(addr, block, srv.DataShards, srv.ParityShards)

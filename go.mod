@@ -3,10 +3,12 @@ module github.com/sleep2death/robin
 go 1.18
 
 require (
+	github.com/golang/protobuf v1.4.2
 	github.com/stretchr/testify v1.7.2
 	github.com/xtaci/kcp-go v5.4.20+incompatible
 	go.uber.org/zap v1.21.0
 	golang.org/x/crypto v0.0.0-20220525230936-793ad666bf5e
+	google.golang.org/protobuf v1.23.0
 )
 
 require (

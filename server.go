@@ -59,21 +59,19 @@ type Server struct {
   inShutdown int32
 }
 
-func (srv *Server) Serve(ln *kcp.Listener) error {
+func (srv *Server) Serve() error {
   // close kcp listener in the end
-  l := &onceCloseListener{Listener: ln}
+  l := &onceCloseListener{Listener: srv.Listener}
 	defer func() {
 		if err := l.Close(); err != nil {
 			panic(err)
 		}
 	}()
 
-  srv.Listener = ln
-
   var tempDelay time.Duration // how long to sleep on accept failure
 
   for {
-    rw, err := ln.AcceptKCP()
+    rw, err := srv.Listener.AcceptKCP()
     srv.Logger.Infof("[robin]: new connection accepted, %s", rw.RemoteAddr().String())
     // handle acception errors
     if err != nil {
@@ -281,18 +279,11 @@ func (srv *Server) idleTimeout() time.Duration {
 	return srv.ReadTimeout
 }
 
-
-
-func Key(pass, salt string) (key []byte) {
-  key = pbkdf2.Key([]byte(pass), []byte(salt), 1024, 32, sha1.New) 
-  return
-}
-
-func ListenAndServe(addr string, key []byte, handler Handler) error {
+func DefaultServer(addr string, key []byte, handler Handler) (*Server, error) {
   // using AES128 as default encrypt block
   block, err := kcp.NewAESBlockCrypt(key)
   if err != nil {
-    return err
+    return nil, err
   }
 
   var srv = &Server{
@@ -310,15 +301,32 @@ func ListenAndServe(addr string, key []byte, handler Handler) error {
 
   ln, err := kcp.ListenWithOptions(addr, block, srv.DataShards, srv.ParityShards)
   if err != nil {
-    return err
+    return nil, err
   }
 
   // using sugared zap as logger
   logger, _ := zap.NewProduction()
   slogger := logger.Sugar()
-  srv.Logger = slogger
 
-  return srv.Serve(ln)
+  srv.Logger = slogger
+  srv.Listener = ln
+
+  return srv, nil
+}
+
+
+
+func Key(pass, salt string) (key []byte) {
+  key = pbkdf2.Key([]byte(pass), []byte(salt), 1024, 32, sha1.New) 
+  return
+}
+
+func ListenAndServe(addr string, key []byte, handler Handler) error {
+  srv, err := DefaultServer(addr, key, handler)
+  if err != nil {
+    return err
+  }
+  return srv.Serve()
 }
 
 // POOL  -------------------------------------------------

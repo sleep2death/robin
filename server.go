@@ -16,27 +16,35 @@ import (
 )
 
 var (
-  ErrServerClosed = errors.New("[robin]: server closed")
+	ErrServerClosed = errors.New("[robin]: server closed")
 )
 
 type Handler interface {
-  Serve(ResponseWriter, *Request)
+	Serve(ResponseWriter, *Request)
 }
 
 type Request struct {
-  TypeUrl string
-  Data []byte
+	conn    *conn
+	TypeUrl string
+	Data    []byte
+}
+
+func (req *Request) RemoteAddr() string {
+	if req.conn != nil {
+		return req.conn.remoteAddr
+	}
+	return "0.0.0.0"
 }
 
 type Server struct {
-  Listener *kcp.Listener
-  Handler Handler
-  Logger *zap.SugaredLogger
-  
-  // max buf size
-  MaxBufSize uint
+	Listener *kcp.Listener
+	Handler  Handler
+	Logger   *zap.SugaredLogger
 
-  // ReadTimeout is the maximum duration for reading the entire
+	// max buf size
+	MaxBufSize uint
+
+	// ReadTimeout is the maximum duration for reading the entire
 	// request, including the body.
 	ReadTimeout time.Duration
 	// WriteTimeout is the maximum duration before timing out
@@ -46,42 +54,42 @@ type Server struct {
 	// next request.
 	IdleTimeout time.Duration
 
-  // 'block' is the block encryption algorithm to encrypt packets.
-  Block kcp.BlockCrypt
-  // 'dataShards', 'parityShards' specifiy how many parity packets will be generated following the data packets.
-  DataShards int
-  ParityShards int
+	// 'block' is the block encryption algorithm to encrypt packets.
+	Block kcp.BlockCrypt
+	// 'dataShards', 'parityShards' specifiy how many parity packets will be generated following the data packets.
+	DataShards   int
+	ParityShards int
 
-  mu         sync.Mutex
+	mu         sync.Mutex
 	activeConn map[*conn]struct{}
 	doneChan   chan struct{}
 	onShutdown []func()
-  inShutdown int32
+	inShutdown int32
 }
 
 func (srv *Server) Serve() error {
-  // close kcp listener in the end
-  l := &onceCloseListener{Listener: srv.Listener}
+	// close kcp listener in the end
+	l := &onceCloseListener{Listener: srv.Listener}
 	defer func() {
 		if err := l.Close(); err != nil {
 			panic(err)
 		}
 	}()
 
-  var tempDelay time.Duration // how long to sleep on accept failure
+	var tempDelay time.Duration // how long to sleep on accept failure
 
-  for {
-    rw, err := srv.Listener.AcceptKCP()
-    srv.Logger.Infof("[robin]: new connection accepted, %s", rw.RemoteAddr().String())
-    // handle acception errors
-    if err != nil {
-      select {
-       case <-srv.getDoneChan():
-          return ErrServerClosed
-        default:
+	for {
+		rw, err := srv.Listener.AcceptKCP()
+		srv.Logger.Infof("[robin]: new connection accepted, %s", rw.RemoteAddr().String())
+		// handle acception errors
+		if err != nil {
+			select {
+			case <-srv.getDoneChan():
+				return ErrServerClosed
+			default:
 			}
 
-      if ne, ok := err.(net.Error); ok && ne.Temporary() {
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
 				if tempDelay == 0 {
 					tempDelay = 5 * time.Millisecond
 				} else {
@@ -90,19 +98,19 @@ func (srv *Server) Serve() error {
 				if max := 1 * time.Second; tempDelay > max {
 					tempDelay = max
 				}
-        srv.Logger.Errorf("[robin]: Accept error: %v; retrying in %v", err, tempDelay)
+				srv.Logger.Errorf("[robin]: Accept error: %v; retrying in %v", err, tempDelay)
 				time.Sleep(tempDelay)
 				continue
 			}
 			return err
-    }
-    tempDelay = 0
+		}
+		tempDelay = 0
 
-    c := srv.newConn(rw)
+		c := srv.newConn(rw)
 		c.setState(c.rwc, StateNew)
 
-    go c.serve()
-  }
+		go c.serve()
+	}
 }
 
 // onceCloseListener wraps a net.Listener, protecting it from
@@ -183,10 +191,10 @@ func (srv *Server) Close() error {
 func (srv *Server) closeListenerLocked() error {
 	var err error
 	ln := srv.Listener
-  if cerr := (*ln).Close(); cerr != nil && err == nil {
-    err = cerr
-  }
-	
+	if cerr := (*ln).Close(); cerr != nil && err == nil {
+		err = cerr
+	}
+
 	return err
 }
 
@@ -198,7 +206,6 @@ func (srv *Server) newConn(rwc net.Conn) *conn {
 	}
 	return c
 }
-
 
 func (srv *Server) shuttingDown() bool {
 	// TODO: replace inShutdown with the existing atomicBool type;
@@ -212,11 +219,11 @@ func (srv *Server) shuttingDown() bool {
 var shutdownPollInterval = 500 * time.Millisecond
 
 // Shutdown gracefully shuts down the server without interrupting any
-// active connections. 
+// active connections.
 // Once Shutdown has been called on a server, it may not be reused;
 // future calls to methods such as Serve will return ErrServerClosed.
 func (srv *Server) Shutdown() error {
-  srv.Logger.Info("[robin]: start to shutdown...")
+	srv.Logger.Info("[robin]: start to shutdown...")
 
 	atomic.StoreInt32(&srv.inShutdown, 1)
 
@@ -232,7 +239,7 @@ func (srv *Server) Shutdown() error {
 	defer ticker.Stop()
 	for {
 		if srv.closeIdleConns() {
-      srv.Logger.Info("[robin]: shutdown completed")
+			srv.Logger.Info("[robin]: shutdown completed")
 			return lnerr
 		}
 		select {
@@ -240,7 +247,7 @@ func (srv *Server) Shutdown() error {
 			srv.mu.Lock()
 			num := len(srv.activeConn)
 			srv.mu.Unlock()
-      srv.Logger.Infof("[robin]: waiting on %v connections", num)
+			srv.Logger.Infof("[robin]: waiting on %v connections", num)
 		}
 	}
 }
@@ -280,53 +287,51 @@ func (srv *Server) idleTimeout() time.Duration {
 }
 
 func DefaultServer(addr string, key []byte, handler Handler) (*Server, error) {
-  // using AES128 as default encrypt block
-  block, err := kcp.NewAESBlockCrypt(key)
-  if err != nil {
-    return nil, err
-  }
+	// using AES128 as default encrypt block
+	block, err := kcp.NewAESBlockCrypt(key)
+	if err != nil {
+		return nil, err
+	}
 
-  var srv = &Server{
-    Block: block,
-    MaxBufSize: 4096,
-    // Check https://github.com/klauspost/reedsolomon for details
-    DataShards: 10,
-    ParityShards: 3,
-    Handler: handler,
+	var srv = &Server{
+		Block:      block,
+		MaxBufSize: 4096,
+		// Check https://github.com/klauspost/reedsolomon for details
+		DataShards:   10,
+		ParityShards: 3,
+		Handler:      handler,
 
-    IdleTimeout: time.Second * 5,
-    WriteTimeout: time.Second * 5,
-    ReadTimeout: time.Second * 5,
-  }
+		IdleTimeout:  time.Second * 5,
+		WriteTimeout: time.Second * 5,
+		ReadTimeout:  time.Second * 5,
+	}
 
-  ln, err := kcp.ListenWithOptions(addr, block, srv.DataShards, srv.ParityShards)
-  if err != nil {
-    return nil, err
-  }
+	ln, err := kcp.ListenWithOptions(addr, block, srv.DataShards, srv.ParityShards)
+	if err != nil {
+		return nil, err
+	}
 
-  // using sugared zap as logger
-  logger, _ := zap.NewProduction()
-  slogger := logger.Sugar()
+	// using sugared zap as logger
+	logger, _ := zap.NewProduction()
+	slogger := logger.Sugar()
 
-  srv.Logger = slogger
-  srv.Listener = ln
+	srv.Logger = slogger
+	srv.Listener = ln
 
-  return srv, nil
+	return srv, nil
 }
 
-
-
 func Key(pass, salt string) (key []byte) {
-  key = pbkdf2.Key([]byte(pass), []byte(salt), 1024, 32, sha1.New) 
-  return
+	key = pbkdf2.Key([]byte(pass), []byte(salt), 1024, 32, sha1.New)
+	return
 }
 
 func ListenAndServe(addr string, key []byte, handler Handler) error {
-  srv, err := DefaultServer(addr, key, handler)
-  if err != nil {
-    return err
-  }
-  return srv.Serve()
+	srv, err := DefaultServer(addr, key, handler)
+	if err != nil {
+		return err
+	}
+	return srv.Serve()
 }
 
 // POOL  -------------------------------------------------

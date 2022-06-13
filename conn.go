@@ -159,6 +159,7 @@ func (c *conn) serve() {
 		buf := buf[:n]
 
 		req := new(Request)
+		req.conn = c
 		if err := Unmarshal(buf, req); err != nil {
 			panic(err)
 		}
@@ -167,26 +168,26 @@ func (c *conn) serve() {
 		c.setState(c.rwc, StateActive)
 		w := NewResponseWriter(c.bufw)
 
-    // pass to handler
+		// pass to handler
 		if c.server.Handler != nil {
 			c.server.Handler.Serve(w, req)
 		}
 
-    // flush, if any data to write
-    if w.Buffered() > 0 {
-      if d := c.server.WriteTimeout; d != 0 {
-        c.rwc.SetWriteDeadline(time.Now().Add(d))
-      }
+		// flush, if any data to write
+		if w.Buffered() > 0 {
+			if d := c.server.WriteTimeout; d != 0 {
+				c.rwc.SetWriteDeadline(time.Now().Add(d))
+			}
 
-      if err := w.Flush(); err != nil {
-        panic(err)
-      }
-    }
+			if err := w.Flush(); err != nil {
+				panic(err)
+			}
+		}
 
-    // if the writer require close, then return and close the conn
-    if !w.KeepAlive() {
-      return
-    }
+		// if the writer require close, then return and close the conn
+		if !w.KeepAlive() {
+			return
+		}
 
 		// set rwc to idle state again
 		c.setState(c.rwc, StateIdle)

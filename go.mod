@@ -4,6 +4,7 @@ go 1.18
 
 require (
 	github.com/golang/protobuf v1.4.2
+	github.com/mattn/go-isatty v0.0.14
 	github.com/stretchr/testify v1.7.2
 	github.com/xtaci/kcp-go v5.4.20+incompatible
 	go.uber.org/zap v1.21.0
